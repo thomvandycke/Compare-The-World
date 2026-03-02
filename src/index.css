@@ -1,0 +1,15 @@
+@import "tailwindcss";
+@import "leaflet/dist/leaflet.css";
+
+/* Ensure cursor styles work on Leaflet SVG paths */
+.leaflet-interactive {
+  cursor: pointer;
+}
+
+.cursor-grab {
+  cursor: grab !important;
+}
+
+.cursor-grabbing {
+  cursor: grabbing !important;
+}

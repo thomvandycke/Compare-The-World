@@ -1,0 +1,5 @@
+{
+  "name": "Compare the World",
+  "description": "Compare the relative sizes of different locations on Earth by overlaying their shapes on a common canvas.",
+  "requestFramePermissions": []
+}
