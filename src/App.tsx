@@ -3,57 +3,61 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef } from "react";
-import { Search, Trash2, RotateCw, Globe, Info, X, MapPin, MousePointer2, Map as MapIcon, Anchor, GripVertical } from "lucide-react";
-import { motion, AnimatePresence } from "framer-motion";
+import React, { useEffect, useMemo, useState } from "react";
+import { Search, Menu, X, RotateCw } from "lucide-react";
+import { AnimatePresence, motion } from "framer-motion";
+import { MapContainer, Marker, Polygon, TileLayer, Tooltip, useMap } from "react-leaflet";
+import L from "leaflet";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
-import { MapContainer, TileLayer, Polygon, Marker, Tooltip, useMap } from "react-leaflet";
-import L from "leaflet";
 import { searchLocation } from "./services/nominatim";
 import { LocationData, NominatimResult } from "./types";
 import { calculateArea, getRelativeKilometerOffsets, offsetsToLatLngs } from "./utils/geo";
 
-// Fix for Leaflet default icon paths using CDN
-const DefaultIcon = L.icon({
-    iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
-    shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
-    iconSize: [25, 41],
-    iconAnchor: [12, 41]
+const COLORS = ["#2F6FED", "#3CB371", "#F4A261", "#7C83FD", "#F25F5C"];
+const OVERLAY_FILL_OPACITY = 0.58;
+const OVERLAY_STROKE_OPACITY = 0.9;
+const MAX_LOCATIONS = 5;
+const SESSION_HINT_KEY = "ctw-drag-hint-dismissed";
+
+const centerHandleIcon = L.divIcon({
+  className: "",
+  html: '<span class="ctw-map-handle"></span>',
+  iconSize: [12, 12],
+  iconAnchor: [6, 6],
 });
 
-L.Marker.prototype.options.icon = DefaultIcon;
+const mapControllerPropsDefault = {
+  center: null as [number, number] | null,
+  zoom: 6,
+};
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-const COLORS = [
-  "#3B82F6", // Blue
-  "#EF4444", // Red
-  "#10B981", // Emerald
-  "#F59E0B", // Amber
-  "#8B5CF6", // Violet
-  "#EC4899", // Pink
-  "#06B6D4", // Cyan
-];
+function formatArea(areaKm2?: number): string {
+  if (!Number.isFinite(areaKm2) || !areaKm2 || areaKm2 <= 0) {
+    return "Area unavailable";
+  }
+  return `${Math.abs(areaKm2).toLocaleString(undefined, { maximumFractionDigits: 0 })} km²`;
+}
 
-// Helper to fly map to location and handle global map events
-const MapController = ({ 
-  center, 
-  zoom, 
-  draggingId, 
-  onDrag, 
-  onDragEnd 
-}: { 
-  center: [number, number] | null, 
-  zoom: number,
-  draggingId: string | null,
-  onDrag: (latlng: L.LatLng) => void,
-  onDragEnd: () => void
+const MapController = ({
+  center,
+  zoom,
+  draggingId,
+  onDrag,
+  onDragEnd,
+}: {
+  center: [number, number] | null;
+  zoom: number;
+  draggingId: string | null;
+  onDrag: (latlng: L.LatLng) => void;
+  onDragEnd: () => void;
 }) => {
   const map = useMap();
-  
+
   useEffect(() => {
     if (center) {
       map.flyTo(center, zoom);
@@ -62,28 +66,25 @@ const MapController = ({
 
   useEffect(() => {
     const handleMouseMove = (e: L.LeafletMouseEvent) => {
-      if (draggingId) {
-        onDrag(e.latlng);
-      }
+      if (draggingId) onDrag(e.latlng);
     };
 
     const handleMouseUp = () => {
-      if (draggingId) {
-        map.dragging.enable();
-        onDragEnd();
-      }
+      if (!draggingId) return;
+      map.dragging.enable();
+      onDragEnd();
     };
 
     if (draggingId) {
-      map.on('mousemove', handleMouseMove);
-      map.on('mouseup', handleMouseUp);
+      map.on("mousemove", handleMouseMove);
+      map.on("mouseup", handleMouseUp);
     }
 
     return () => {
-      map.off('mousemove', handleMouseMove);
-      map.off('mouseup', handleMouseUp);
+      map.off("mousemove", handleMouseMove);
+      map.off("mouseup", handleMouseUp);
     };
-  }, [draggingId, onDrag, onDragEnd, map]);
+  }, [draggingId, map, onDrag, onDragEnd]);
 
   return null;
 };
@@ -94,44 +95,67 @@ export default function App() {
   const [searchResults, setSearchResults] = useState<NominatimResult[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [flyTo, setFlyTo] = useState<{ center: [number, number], zoom: number } | null>(null);
-  
-  // Dragging state for polygons
+  const [flyTo, setFlyTo] = useState<{ center: [number, number]; zoom: number } | null>(null);
   const [draggingId, setDraggingId] = useState<string | null>(null);
-  const [dragOffset, setDragOffset] = useState<{ lat: number, lng: number } | null>(null);
+  const [dragOffset, setDragOffset] = useState<{ lat: number; lng: number } | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(
+    () => (typeof window !== "undefined" ? window.innerWidth >= 1024 : true)
+  );
+  const [resultIndex, setResultIndex] = useState(-1);
+  const [showDragHint, setShowDragHint] = useState(true);
 
-  // Search logic
+  useEffect(() => {
+    const dismissed = typeof window !== "undefined" && sessionStorage.getItem(SESSION_HINT_KEY) === "1";
+    if (dismissed) setShowDragHint(false);
+  }, []);
+
+  useEffect(() => {
+    const onResize = () => {
+      if (window.innerWidth >= 1024) setSidebarOpen(true);
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
   useEffect(() => {
     const delayDebounceFn = setTimeout(async () => {
-      if (searchQuery.length >= 2) {
-        setIsSearching(true);
-        const results = await searchLocation(searchQuery);
-        setSearchResults(results.filter(r => r.geojson));
-        setIsSearching(false);
-      } else {
+      if (searchQuery.length < 2) {
         setSearchResults([]);
+        setResultIndex(-1);
+        return;
       }
-    }, 500);
+
+      setIsSearching(true);
+      const results = await searchLocation(searchQuery);
+      const filtered = results.filter((result) => result.geojson);
+      setSearchResults(filtered);
+      setResultIndex(filtered.length > 0 ? 0 : -1);
+      setIsSearching(false);
+    }, 350);
 
     return () => clearTimeout(delayDebounceFn);
   }, [searchQuery]);
 
+  const dismissDragHint = () => {
+    if (!showDragHint) return;
+    setShowDragHint(false);
+    sessionStorage.setItem(SESSION_HINT_KEY, "1");
+  };
+
   const addLocation = (result: NominatimResult) => {
-    if (locations.length >= 5) {
+    if (locations.length >= MAX_LOCATIONS) {
       alert("You can only compare up to 5 locations at once.");
       return;
     }
 
-    const id = Math.random().toString(36).substring(7);
-    const color = COLORS[locations.length % COLORS.length];
-    const area = calculateArea(result.geojson);
+    const id = Math.random().toString(36).slice(2);
+    const area = Math.abs(calculateArea(result.geojson));
+    const safeArea = Number.isFinite(area) && area > 0 ? area : undefined;
     const offsets = getRelativeKilometerOffsets(result.geojson);
-    
     const lat = parseFloat(result.lat);
     const lng = parseFloat(result.lon);
-
     const isPrimary = locations.length === 0;
-    const primaryLoc = locations.find(l => l.isPrimary);
+    const primaryLoc = locations.find((location) => location.isPrimary);
 
     const newLocation: LocationData = {
       id,
@@ -139,77 +163,91 @@ export default function App() {
       displayName: result.display_name,
       geojson: result.geojson,
       offsets,
-      color,
+      color: COLORS[locations.length % COLORS.length],
       lat: isPrimary ? lat : (primaryLoc?.lat ?? lat),
       lng: isPrimary ? lng : (primaryLoc?.lng ?? lng),
       rotation: 0,
       visible: true,
-      areaKm2: area,
+      areaKm2: safeArea,
       isPrimary,
     };
 
-    setLocations([...locations, newLocation]);
+    setLocations((prev) => [...prev, newLocation]);
     setSearchQuery("");
     setSearchResults([]);
+    setResultIndex(-1);
     setSelectedId(id);
 
-    // If it's the first location, fly to it
     if (isPrimary) {
-      setFlyTo({ center: [lat, lng], zoom: 6 });
+      setFlyTo({ center: [lat, lng], zoom: 5 });
     }
   };
 
   const removeLocation = (id: string) => {
-    const filtered = locations.filter((l) => l.id !== id);
-    if (filtered.length > 0 && !filtered.some(l => l.isPrimary)) {
-      filtered[0].isPrimary = true;
-    }
-    setLocations(filtered);
+    setLocations((prev) => {
+      const filtered = prev.filter((location) => location.id !== id);
+      if (filtered.length > 0 && !filtered.some((location) => location.isPrimary)) {
+        filtered[0].isPrimary = true;
+      }
+      return filtered;
+    });
     if (selectedId === id) setSelectedId(null);
   };
 
+  const removeAll = () => {
+    setLocations([]);
+    setSelectedId(null);
+  };
+
+  const setAsReference = (id: string) => {
+    setLocations((prev) =>
+      prev.map((location) => ({
+        ...location,
+        isPrimary: location.id === id,
+      }))
+    );
+
+    const selected = locations.find((location) => location.id === id);
+    if (selected) {
+      setFlyTo({ center: [selected.lat, selected.lng], zoom: 5 });
+    }
+  };
+
   const toggleVisibility = (id: string) => {
-    setLocations(
-      locations.map((l) => (l.id === id ? { ...l, visible: !l.visible } : l))
+    setLocations((prev) =>
+      prev.map((location) =>
+        location.id === id ? { ...location, visible: !location.visible } : location
+      )
     );
   };
 
   const updateLocation = (id: string, updates: Partial<LocationData>) => {
-    setLocations(locations.map((l) => (l.id === id ? { ...l, ...updates } : l)));
-  };
-
-  const handleDragEnd = (id: string, e: any) => {
-    const marker = e.target;
-    const position = marker.getLatLng();
-    updateLocation(id, { lat: position.lat, lng: position.lng });
+    setLocations((prev) =>
+      prev.map((location) => (location.id === id ? { ...location, ...updates } : location))
+    );
   };
 
   const handlePolygonMouseDown = (id: string, e: L.LeafletMouseEvent) => {
-    const loc = locations.find(l => l.id === id);
-    if (!loc) return;
-    
-    // Stop the DOM event from reaching the map container
+    const location = locations.find((entry) => entry.id === id);
+    if (!location) return;
+
     L.DomEvent.stop(e.originalEvent);
-    
-    const mouseLatLng = e.latlng;
+    dismissDragHint();
     setDraggingId(id);
     setDragOffset({
-      lat: loc.lat - mouseLatLng.lat,
-      lng: loc.lng - mouseLatLng.lng,
+      lat: location.lat - e.latlng.lat,
+      lng: location.lng - e.latlng.lng,
     });
-    
-    // Disable map dragging while dragging polygon
     e.target._map.dragging.disable();
     setSelectedId(id);
   };
 
   const handleMapDrag = (latlng: L.LatLng) => {
-    if (draggingId && dragOffset) {
-      updateLocation(draggingId, {
-        lat: latlng.lat + dragOffset.lat,
-        lng: latlng.lng + dragOffset.lng,
-      });
-    }
+    if (!draggingId || !dragOffset) return;
+    updateLocation(draggingId, {
+      lat: latlng.lat + dragOffset.lat,
+      lng: latlng.lng + dragOffset.lng,
+    });
   };
 
   const handleMapDragEnd = () => {
@@ -218,77 +256,123 @@ export default function App() {
   };
 
   const handleRotate = (id: string) => {
-    const loc = locations.find((l) => l.id === id);
-    if (loc) {
-      updateLocation(id, { rotation: (loc.rotation + 45) % 360 });
-    }
+    const location = locations.find((entry) => entry.id === id);
+    if (!location) return;
+    updateLocation(id, { rotation: (location.rotation + 45) % 360 });
   };
 
-  const clearAll = () => {
-    setLocations([]);
-    setSelectedId(null);
-  };
-
-  const setAsPrimary = (id: string) => {
-    setLocations(locations.map(l => ({
-      ...l,
-      isPrimary: l.id === id
-    })));
-    
-    const loc = locations.find(l => l.id === id);
-    if (loc) {
-      setFlyTo({ center: [loc.lat, loc.lng], zoom: 6 });
-    }
-  };
+  const selectedLocation = useMemo(
+    () => locations.find((location) => location.id === selectedId) ?? null,
+    [locations, selectedId]
+  );
 
   return (
-    <div className="flex h-screen w-full bg-[#f8fafc] text-slate-900 overflow-hidden font-sans">
-      {/* Sidebar */}
-      <aside className="w-80 bg-white border-r border-slate-200 flex flex-col z-20 shadow-xl">
-        <div className="p-6 border-bottom border-slate-100">
-          <div className="flex items-center gap-2 mb-2">
-            <div className="p-2 bg-blue-600 rounded-lg text-white">
-              <Globe size={20} />
+    <div className="relative h-screen w-full overflow-hidden bg-[var(--bg)] text-[var(--text)]">
+      <AnimatePresence>
+        {sidebarOpen && (
+          <motion.button
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-30 bg-black/25 lg:hidden"
+            onClick={() => setSidebarOpen(false)}
+            aria-label="Close panel backdrop"
+          />
+        )}
+      </AnimatePresence>
+
+      <aside
+        className={cn(
+          "ctw-panel fixed inset-y-0 left-0 z-40 flex flex-col transition-transform duration-150 lg:static lg:translate-x-0",
+          sidebarOpen ? "translate-x-0" : "-translate-x-full"
+        )}
+      >
+        <div className="border-b border-[var(--border)] px-6 py-5">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="flex h-8 w-8 items-center justify-center overflow-hidden rounded-[var(--r-sm)] border border-[var(--border)] bg-[var(--surface)]">
+                <img
+                  src="/compare-the-world-logo.svg"
+                  alt="Compare the World logo"
+                  className="h-[30px] w-[30px] object-contain"
+                />
+              </div>
+              <h1 className="text-[20px] font-semibold">Compare the World</h1>
             </div>
-            <h1 className="text-xl font-bold tracking-tight">Compare the World</h1>
+            <button
+              className="ctw-action-btn inline-flex items-center justify-center lg:hidden"
+              onClick={() => setSidebarOpen(false)}
+              aria-label="Close sidebar"
+            >
+              <X size={18} />
+            </button>
           </div>
-          <p className="text-xs text-slate-500 font-medium uppercase tracking-wider">Compare Relative Sizes</p>
+          <p
+            className="mt-3 text-[13px] font-semibold uppercase"
+            style={{ letterSpacing: "0.08em", color: "var(--text-3)" }}
+          >
+            Visual Size Comparison
+          </p>
         </div>
 
-        <div className="px-4 pb-4">
+        <div className="relative px-5 pb-2 pt-4">
+          <label htmlFor="location-search" className="sr-only">
+            Search location
+          </label>
           <div className="relative">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
+            <Search size={18} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-3)]" />
             <input
+              id="location-search"
               type="text"
-              placeholder="Search country, state, city..."
-              className="w-full pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all text-sm"
               value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
+              onChange={(event) => setSearchQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (searchResults.length === 0) return;
+                if (event.key === "ArrowDown") {
+                  event.preventDefault();
+                  setResultIndex((prev) => Math.min(searchResults.length - 1, prev + 1));
+                } else if (event.key === "ArrowUp") {
+                  event.preventDefault();
+                  setResultIndex((prev) => Math.max(0, prev - 1));
+                } else if (event.key === "Enter") {
+                  event.preventDefault();
+                  const selected = searchResults[resultIndex] ?? searchResults[0];
+                  if (selected) addLocation(selected);
+                } else if (event.key === "Escape") {
+                  setSearchResults([]);
+                  setResultIndex(-1);
+                }
+              }}
+              placeholder="Search a country, state, or city…"
+              className="ctw-search w-full pl-11 pr-11"
             />
             {isSearching && (
-              <div className="absolute right-3 top-1/2 -translate-y-1/2">
-                <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
-              </div>
+              <div className="absolute right-3 top-1/2 h-5 w-5 -translate-y-1/2 rounded-full border-2 border-[var(--brand)] border-t-transparent animate-spin" />
             )}
           </div>
 
-          {/* Search Results */}
           <AnimatePresence>
             {searchResults.length > 0 && (
               <motion.div
-                initial={{ opacity: 0, y: -10 }}
+                initial={{ opacity: 0, y: -8 }}
                 animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                className="absolute left-4 right-4 mt-2 bg-white border border-slate-200 rounded-xl shadow-2xl z-30 max-h-64 overflow-y-auto"
+                exit={{ opacity: 0, y: -8 }}
+                className="ctw-results absolute left-5 right-5 top-[66px] z-50 max-h-72 overflow-y-auto"
+                role="listbox"
               >
-                {searchResults.map((result) => (
+                {searchResults.map((result, index) => (
                   <button
                     key={result.place_id}
+                    className={cn(
+                      "flex min-h-10 w-full items-start border-b border-[var(--border)] px-4 py-3 text-left text-[14px] text-[var(--text)] last:border-b-0",
+                      resultIndex === index ? "bg-[var(--surface-2)]" : "hover:bg-[var(--surface-2)]"
+                    )}
+                    onMouseEnter={() => setResultIndex(index)}
                     onClick={() => addLocation(result)}
-                    className="w-full px-4 py-3 text-left hover:bg-slate-50 transition-colors border-b border-slate-50 last:border-0 flex items-start gap-3"
+                    role="option"
+                    aria-selected={resultIndex === index}
                   >
-                    <MapPin size={16} className="mt-0.5 text-slate-400 shrink-0" />
-                    <span className="text-sm text-slate-700 line-clamp-2">{result.display_name}</span>
+                    {result.display_name}
                   </button>
                 ))}
               </motion.div>
@@ -296,104 +380,114 @@ export default function App() {
           </AnimatePresence>
         </div>
 
-        <div className="flex-1 overflow-y-auto px-4 py-2 space-y-3">
-          <div className="flex items-center justify-between px-1">
-            <h2 className="text-xs font-bold text-slate-400 uppercase tracking-widest">Active Layers ({locations.length}/5)</h2>
-            {locations.length > 0 && (
-              <button onClick={clearAll} className="text-[10px] font-bold text-red-500 hover:text-red-600 uppercase tracking-wider">Clear All</button>
-            )}
+        <div className="flex-1 overflow-y-auto px-5 pb-5">
+          {locations.length === 0 && (
+            <div className="ctw-instruction-card mt-3">
+              <h2 className="text-[16px] font-semibold">How it works</h2>
+              <ol className="mt-2 space-y-1 text-[14px] text-[var(--text-2)]">
+                <li>1. Search for a place</li>
+                <li>2. Add up to 5 locations</li>
+                <li>3. Drag them to compare</li>
+                <li>4. Set one as reference</li>
+              </ol>
+            </div>
+          )}
+
+          <div className="mt-[18px] flex items-center justify-between">
+            <h3 className="text-[13px] font-semibold text-[var(--text-2)]">Locations Added</h3>
+            <p className="text-[13px] font-semibold text-[var(--text-2)] numeric">
+              {locations.length} of {MAX_LOCATIONS}
+            </p>
           </div>
 
+          {locations.length > 0 && (
+            <button
+              onClick={removeAll}
+              className="mt-2 min-h-10 text-[14px] font-semibold text-[var(--danger)] hover:underline"
+            >
+              Remove All
+            </button>
+          )}
+
           {locations.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-12 text-center px-4">
-              <div className="w-12 h-12 bg-slate-50 rounded-full flex items-center justify-center mb-4 text-slate-300">
-                <MousePointer2 size={24} />
-              </div>
-              <p className="text-sm text-slate-500 font-medium">No locations added yet.</p>
-              <p className="text-xs text-slate-400 mt-1">Search for a place above to start comparing.</p>
+            <div className="mt-5 rounded-[var(--r-md)] border border-[var(--border)] bg-[var(--surface)] p-4">
+              <p className="text-[16px] font-semibold">No locations yet</p>
+              <p className="mt-1 text-[14px] text-[var(--text-2)]">
+                Search for a place above to start comparing.
+              </p>
             </div>
           ) : (
-            <div className="space-y-2">
-              {locations.map((loc) => (
+            <div className="mt-3 space-y-3 pb-4">
+              {locations.map((location) => (
                 <motion.div
                   layout
-                  initial={{ opacity: 0, x: -20 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  key={loc.id}
-                  onClick={() => setSelectedId(loc.id)}
+                  key={location.id}
                   className={cn(
-                    "p-3 rounded-xl border transition-all cursor-pointer group",
-                    selectedId === loc.id
-                      ? "bg-white border-blue-200 shadow-md ring-1 ring-blue-100"
-                      : "bg-slate-50 border-transparent hover:border-slate-200"
+                    "ctw-location-card",
+                    selectedId === location.id ? "border-[var(--brand)]" : "",
+                    location.isPrimary ? "reference" : ""
                   )}
+                  onClick={() => setSelectedId(location.id)}
                 >
-                  <div className="flex items-center justify-between mb-2">
-                    <div className="flex items-center gap-2 overflow-hidden">
-                      <div className="relative">
-                        <div 
-                          className="w-3 h-3 rounded-full shrink-0 cursor-pointer hover:ring-2 hover:ring-offset-1 hover:ring-slate-300 transition-all" 
-                          style={{ backgroundColor: loc.color }}
-                          title="Change Color"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            const input = e.currentTarget.nextElementSibling as HTMLInputElement;
-                            input.click();
-                          }}
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span
+                          className="h-3 w-3 shrink-0 rounded-full"
+                          style={{ backgroundColor: location.color }}
+                          aria-hidden="true"
                         />
-                        <input 
-                          type="color" 
-                          className="absolute opacity-0 w-0 h-0 pointer-events-none"
-                          value={loc.color}
-                          onChange={(e) => {
-                            updateLocation(loc.id, { color: e.target.value });
-                          }}
-                          onClick={(e) => e.stopPropagation()}
-                        />
+                        <p className="truncate text-[16px] font-semibold">{location.name}</p>
+                        {location.isPrimary && <span className="ctw-reference-badge">REFERENCE</span>}
                       </div>
-                      <span className="text-sm font-semibold truncate text-slate-700">{loc.name}</span>
-                      {loc.isPrimary && (
-                        <span className="px-1.5 py-0.5 bg-blue-100 text-blue-600 text-[8px] font-bold rounded uppercase tracking-tighter flex items-center gap-0.5">
-                          <Anchor size={8} /> Primary
-                        </span>
-                      )}
+                      <p className="numeric mt-1 text-[14px] text-[var(--text-2)]">
+                        {formatArea(location.areaKm2)}
+                      </p>
                     </div>
-                    <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                      {!loc.isPrimary && (
-                        <button
-                          onClick={(e) => { e.stopPropagation(); setAsPrimary(loc.id); }}
-                          className="p-1.5 hover:bg-blue-50 text-blue-400 hover:text-blue-600 rounded-lg transition-colors"
-                          title="Set as Primary"
-                        >
-                          <Anchor size={14} />
-                        </button>
-                      )}
-                      <button
-                        onClick={(e) => { e.stopPropagation(); handleRotate(loc.id); }}
-                        className="p-1.5 hover:bg-slate-200 rounded-lg text-slate-500 transition-colors"
-                        title="Rotate 45°"
-                      >
-                        <RotateCw size={14} />
-                      </button>
-                      <button
-                        onClick={(e) => { e.stopPropagation(); removeLocation(loc.id); }}
-                        className="p-1.5 hover:bg-red-100 hover:text-red-600 rounded-lg text-slate-500 transition-colors"
-                        title="Remove"
-                      >
-                        <Trash2 size={14} />
-                      </button>
-                    </div>
+                    <button
+                      className={cn("ctw-toggle shrink-0", location.visible ? "on" : "")}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        toggleVisibility(location.id);
+                      }}
+                      aria-label="Toggle visibility"
+                      aria-pressed={location.visible}
+                    />
                   </div>
-                  <div className="flex items-center justify-between text-[10px] font-mono text-slate-400">
-                    <span>{loc.areaKm2?.toLocaleString(undefined, { maximumFractionDigits: 0 })} km²</span>
-                    <div className="flex items-center gap-2">
+
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <p className="min-h-10 min-w-10 text-[14px] font-medium text-[var(--text-2)]">
+                      Shown on Map
+                    </p>
+                    {!location.isPrimary && (
                       <button
-                        onClick={(e) => { e.stopPropagation(); toggleVisibility(loc.id); }}
-                        className={cn("hover:underline", loc.visible ? "text-blue-500" : "text-slate-400")}
+                        className="ctw-action-btn border-[var(--border)] px-3 text-[var(--text)] hover:bg-[var(--surface-2)]"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setAsReference(location.id);
+                        }}
                       >
-                        {loc.visible ? "Visible" : "Hidden"}
+                        Set as Reference
                       </button>
-                    </div>
+                    )}
+                    <button
+                      className="ctw-action-btn border-[var(--border)] px-3 text-[var(--text)] hover:bg-[var(--surface-2)]"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        handleRotate(location.id);
+                      }}
+                    >
+                      Rotate 45°
+                    </button>
+                    <button
+                      className="ctw-action-btn border-[var(--border)] px-3 text-[var(--danger)] hover:bg-[var(--surface-2)]"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        removeLocation(location.id);
+                      }}
+                    >
+                      Remove
+                    </button>
                   </div>
                 </motion.div>
               ))}
@@ -401,141 +495,123 @@ export default function App() {
           )}
         </div>
 
-        <div className="p-4 bg-slate-50 border-t border-slate-100">
-          <div className="flex items-center gap-2 text-slate-500 mb-3">
-            <Info size={14} />
-            <p className="text-[10px] leading-tight">
-              All locations are draggable. Grab the shape or the center handle to move them.
-            </p>
-          </div>
+        <div className="border-t border-[var(--border)] bg-[var(--surface-2)] px-5 py-4">
+          <p className="text-[14px] text-[var(--text-2)]">
+            All locations are draggable. Grab the shape to move it.
+          </p>
         </div>
       </aside>
 
-      {/* Main Map */}
-      <main className="flex-1 relative bg-[#e2e8f0] overflow-hidden">
+      <main className="h-full lg:ml-[360px]">
+        <button
+          className="ctw-action-btn fixed left-3 top-3 z-20 inline-flex items-center justify-center border border-[var(--border)] bg-[var(--surface)] lg:hidden"
+          onClick={() => setSidebarOpen(true)}
+          aria-label="Open sidebar"
+        >
+          <Menu size={18} />
+        </button>
+
         <MapContainer
           center={[20, 0]}
           zoom={3}
-          style={{ height: "100%", width: "100%" }}
           zoomControl={false}
           attributionControl={false}
+          style={{ width: "100%", height: "100%" }}
         >
-          <TileLayer
-            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-          />
-          <MapController 
-            center={flyTo?.center || null} 
-            zoom={flyTo?.zoom || 6} 
+          <TileLayer url="https://{s}.basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}{r}.png" />
+          <TileLayer url="https://{s}.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}{r}.png" opacity={0.34} />
+
+          <MapController
+            center={flyTo?.center ?? mapControllerPropsDefault.center}
+            zoom={flyTo?.zoom ?? mapControllerPropsDefault.zoom}
             draggingId={draggingId}
             onDrag={handleMapDrag}
             onDragEnd={handleMapDragEnd}
           />
 
-          {locations.map((loc) => (
-            <React.Fragment key={loc.id}>
-              {loc.visible && (
+          {locations.map((location) => {
+            if (!location.visible) return null;
+            const positions = offsetsToLatLngs(
+              location.offsets,
+              location.lat,
+              location.lng,
+              location.rotation
+            );
+            const isSelected = selectedId === location.id;
+            return (
+              <React.Fragment key={location.id}>
                 <Polygon
-                  positions={offsetsToLatLngs(loc.offsets, loc.lat, loc.lng, loc.rotation)}
+                  positions={positions}
                   bubblingMouseEvents={false}
                   pathOptions={{
-                    color: loc.color,
-                    fillColor: loc.color,
-                    fillOpacity: selectedId === loc.id ? 0.3 : 0.15,
+                    color: location.color,
+                    fillColor: location.color,
+                    fillOpacity: OVERLAY_FILL_OPACITY,
+                    opacity: OVERLAY_STROKE_OPACITY,
                     weight: 2,
-                    className: "cursor-grab active:cursor-grabbing",
+                    className: "ctw-overlay cursor-grab active:cursor-grabbing",
                   }}
                   eventHandlers={{
-                    click: (e) => {
-                      L.DomEvent.stop(e.originalEvent);
-                      setSelectedId(loc.id);
+                    click: (event) => {
+                      L.DomEvent.stop(event.originalEvent);
+                      setSelectedId(location.id);
                     },
-                    mousedown: (e) => {
-                      handlePolygonMouseDown(loc.id, e);
-                    },
+                    mousedown: (event) => handlePolygonMouseDown(location.id, event),
                   }}
-                >
-                  <Tooltip sticky>{loc.name}</Tooltip>
-                </Polygon>
-              )}
-              
-              {/* Draggable handle for shapes */}
-              {loc.visible && (
-                <Marker
-                  position={[loc.lat, loc.lng]}
-                  draggable={true}
-                  eventHandlers={{
-                    dragend: (e) => handleDragEnd(loc.id, e),
-                    click: () => setSelectedId(loc.id),
-                  }}
-                >
-                  <Tooltip direction="top" offset={[0, -20]} opacity={1}>
-                    Drag to move {loc.name}
-                  </Tooltip>
-                </Marker>
-              )}
-            </React.Fragment>
-          ))}
+                />
+
+                {location.isPrimary && (
+                  <Polygon
+                    positions={positions}
+                    interactive={false}
+                    pathOptions={{
+                      color: "var(--accent)",
+                      fillOpacity: 0,
+                      opacity: 1,
+                      weight: 3,
+                    }}
+                  />
+                )}
+
+                {isSelected && (
+                  <Marker
+                    position={[location.lat, location.lng]}
+                    draggable
+                    icon={centerHandleIcon}
+                    eventHandlers={{
+                      dragstart: () => dismissDragHint(),
+                      dragend: (event) => {
+                        const next = event.target.getLatLng();
+                        updateLocation(location.id, { lat: next.lat, lng: next.lng });
+                      },
+                      click: () => setSelectedId(location.id),
+                    }}
+                  >
+                    {showDragHint && (
+                      <Tooltip direction="top" offset={[0, -10]} permanent opacity={1}>
+                        Drag to move. Use rotate handle to rotate.
+                      </Tooltip>
+                    )}
+                  </Marker>
+                )}
+              </React.Fragment>
+            );
+          })}
         </MapContainer>
 
-        {/* Selected Info Overlay */}
-        <AnimatePresence>
-          {selectedId && (
-            <motion.div
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 20 }}
-              className="absolute top-6 left-1/2 -translate-x-1/2 bg-white/90 backdrop-blur-md px-6 py-3 rounded-2xl shadow-2xl border border-white/20 flex items-center gap-4 z-30"
+        {selectedLocation && (
+          <div className="pointer-events-none absolute bottom-4 right-4 z-20 rounded-[var(--r-md)] border border-[var(--border)] bg-[var(--surface)] px-3 py-2 shadow-[var(--shadow-sm)]">
+            <p className="text-[14px] font-semibold">{selectedLocation.name}</p>
+            <p className="numeric text-[14px] text-[var(--text-2)]">{formatArea(selectedLocation.areaKm2)}</p>
+            <button
+              className="ctw-action-btn pointer-events-auto mt-2 inline-flex items-center justify-center gap-2 border border-[var(--border)] px-3 hover:bg-[var(--surface-2)]"
+              onClick={() => handleRotate(selectedLocation.id)}
             >
-              {(() => {
-                const loc = locations.find(l => l.id === selectedId);
-                if (!loc) return null;
-                return (
-                  <>
-                    <div className="relative">
-                      <div 
-                        className="w-4 h-4 rounded-full cursor-pointer hover:ring-2 hover:ring-offset-1 hover:ring-slate-300 transition-all" 
-                        style={{ backgroundColor: loc.color }}
-                        title="Change Color"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          const input = e.currentTarget.nextElementSibling as HTMLInputElement;
-                          input.click();
-                        }}
-                      />
-                      <input 
-                        type="color" 
-                        className="absolute opacity-0 w-0 h-0 pointer-events-none"
-                        value={loc.color}
-                        onChange={(e) => {
-                          updateLocation(loc.id, { color: e.target.value });
-                        }}
-                        onClick={(e) => e.stopPropagation()}
-                      />
-                    </div>
-                    <div>
-                      <h3 className="text-sm font-bold text-slate-800">{loc.name}</h3>
-                      <p className="text-[10px] text-slate-500 font-mono">{loc.areaKm2?.toLocaleString()} km²</p>
-                    </div>
-                    <div className="w-px h-8 bg-slate-200" />
-                    <div className="flex items-center gap-2">
-                      {!loc.isPrimary && (
-                        <button onClick={() => setAsPrimary(loc.id)} className="p-2 hover:bg-blue-50 rounded-lg text-blue-600 transition-colors" title="Set as Primary">
-                          <Anchor size={16} />
-                        </button>
-                      )}
-                      <button onClick={() => handleRotate(loc.id)} className="p-2 hover:bg-slate-100 rounded-lg text-slate-600 transition-colors">
-                        <RotateCw size={16} />
-                      </button>
-                      <button onClick={() => setSelectedId(null)} className="p-2 hover:bg-slate-100 rounded-lg text-slate-600 transition-colors">
-                        <X size={16} />
-                      </button>
-                    </div>
-                  </>
-                );
-              })()}
-            </motion.div>
-          )}
-        </AnimatePresence>
+              <RotateCw size={16} />
+              Rotate 45°
+            </button>
+          </div>
+        )}
       </main>
     </div>
   );
